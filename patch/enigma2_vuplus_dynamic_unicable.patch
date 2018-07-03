@@ -1,0 +1,885 @@
+diff -ur a/lib/dvb/frontend.cpp b/lib/dvb/frontend.cpp
+--- a/lib/dvb/frontend.cpp	2018-04-09 12:11:52.000000000 +0200
++++ b/lib/dvb/frontend.cpp	2018-06-17 00:06:40.000000000 +0200
+@@ -661,6 +661,7 @@
+ 
+ int eDVBFrontend::closeFrontend(bool force, bool no_delayed)
+ {
++	bool busy = false;
+ 	if (!force && m_data[CUR_VOLTAGE] != -1 && m_data[CUR_VOLTAGE] != iDVBFrontend::voltageOff)
+ 	{
+ 		long tmp = m_data[LINKED_NEXT_PTR];
+@@ -671,40 +672,43 @@
+ 			{
+ 				eDebugNoSimulate("dont close frontend %d until the linked frontend %d in slot %d is still in use",
+ 					m_dvbid, linked_fe->m_frontend->getDVBID(), linked_fe->m_frontend->getSlotID());
+-				return -1;
++				busy = true;
++				break;
+ 			}
+ 			linked_fe->m_frontend->getData(LINKED_NEXT_PTR, tmp);
+ 		}
+ 	}
+-
+-	if (m_fd >= 0)
++	
++	if (m_fd >= 0 && (m_data[SATCR] != -1 || m_data[SATCR_DYNGROUP] != -1))
+ 	{
+-		eDebugNoSimulate("close frontend %d", m_dvbid);
+-		if (m_data[SATCR] != -1)
++		if (!no_delayed)
+ 		{
+-			if (!no_delayed)
+-			{
+-				m_sec->prepareTurnOffSatCR(*this);
+-				m_tuneTimer->start(0, true);
+-				if(!m_tuneTimer->isActive())
++			m_sec->prepareTurnOffSatCR(*this);
++			m_tuneTimer->start(0, true);
++			if(!m_tuneTimer->isActive())
++			{
++				int timeout=0;
++				eDebug("[turnOffSatCR] no mainloop");
++				while(true)
+ 				{
+-					int timeout=0;
+-					eDebug("[turnOffSatCR] no mainloop");
+-					while(true)
+-					{
+-						timeout = tuneLoopInt();
+-						if (timeout == -1)
+-							break;
+-						usleep(timeout*1000); // blockierendes wait.. eTimer gibts ja nicht mehr
+-					}
++					timeout = tuneLoopInt();
++					if (timeout == -1)
++						break;
++					usleep(timeout*1000); // blockierendes wait.. eTimer gibts ja nicht mehr
+ 				}
+-				else
+-					eDebug("[turnOffSatCR] running mainloop");
+-				return 0;
+ 			}
+ 			else
+-				m_data[ROTOR_CMD] = -1;
++				eDebug("[turnOffSatCR] running mainloop");
++			return busy ? -1 : 0;
+ 		}
++	}
++	
++	if (busy)
++		return -1;
++
++	if (m_fd >= 0)
++	{
++		eDebugNoSimulate("close frontend %d", m_dvbid);
+ 
+ 		setTone(iDVBFrontend::toneOff);
+ 		setVoltage(iDVBFrontend::voltageOff);
+@@ -2207,6 +2211,8 @@
+ 		return -ENOENT;
+ 	}
+ 	res = m_sec->prepare(*this, parm, feparm, 1 << m_slotid, tunetimeout);
++	if (res == EAGAIN)
++		return 0;
+ 	if (!res)
+ 	{
+ 		eDebugNoSimulate("prepare_sat Freq %d Pol %d SR %d INV %d FEC %d orbpos %d system %d modulation %d pilot %d, rolloff %d, is_id %d, pls_mode %d, pls_code %d",
+diff -ur a/lib/dvb/frontend.h b/lib/dvb/frontend.h
+--- a/lib/dvb/frontend.h	2018-04-09 12:11:52.000000000 +0200
++++ b/lib/dvb/frontend.h	2018-05-27 10:02:25.000000000 +0200
+@@ -69,6 +69,9 @@
+ 		SATCR,                // current SatCR
+ 		DICTION,              // current diction
+ 		PIN,                  // pin 
++		SATCR_DYNGROUP,       // group for dynamic satcr
++		SATCR_DYNSOCK,        // udp socket for dynamic satcr
++		SATCR_RETRIES,        // request retry count
+ 		NUM_DATA_ENTRIES
+ 	};
+ 	Signal1<void,iDVBFrontend*> m_stateChanged;
+diff -ur a/lib/dvb/sec.cpp b/lib/dvb/sec.cpp
+--- a/lib/dvb/sec.cpp	2018-04-09 12:11:52.000000000 +0200
++++ b/lib/dvb/sec.cpp	2018-06-24 15:58:46.000000000 +0200
+@@ -3,6 +3,14 @@
+ #include <lib/dvb/rotor_calc.h>
+ #include <lib/dvb/dvbtime.h>
+ #include <lib/base/eerror.h>
++
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <netdb.h>
+ #include <set>
+ 
+ //#define SEC_DEBUG
+@@ -96,7 +104,7 @@
+ 	{
+ 		bool rotor=false;
+ 		eDVBSatelliteLNBParameters &lnb_param = m_lnbs[idx];
+-		bool is_unicable = lnb_param.SatCR_idx != -1;
++		bool is_unicable = lnb_param.SatCR_idx != -1 || lnb_param.SatCR_dynGroup != -1;
+ 		bool is_unicable_position_switch = lnb_param.SatCR_positions > 1;
+ 
+ 		if ( lnb_param.m_slot_mask & slot_id ) // lnb for correct tuner?
+@@ -305,7 +313,7 @@
+ 			eDVBSatelliteDiseqcParameters::t_diseqc_mode diseqc_mode = di_param.m_diseqc_mode;
+ 			eDVBSatelliteSwitchParameters::t_voltage_mode voltage_mode = sw_param.m_voltage_mode;
+ 			bool diseqc13V = voltage_mode == eDVBSatelliteSwitchParameters::HV_13;
+-			bool is_unicable = lnb_param.SatCR_idx != -1;
++			bool is_unicable = lnb_param.SatCR_idx != -1 || lnb_param.SatCR_dynGroup != -1;
+ 
+ 			bool useGotoXX = false;
+ 			int RotorCmd=-1;
+@@ -353,6 +361,25 @@
+ 
+ 			if (lastcsw == lastucsw && lastToneburst == lastucsw && lastucsw == -1)
+ 				needDiSEqCReset = true;
++			
++			long oldGroup, oldSatcr;
++			frontend.getData(eDVBFrontend::SATCR_DYNGROUP, oldGroup);
++			frontend.getData(eDVBFrontend::SATCR, oldSatcr);
++			
++			if (lnb_param.SatCR_dynGroup == -1)
++			{
++				if (oldGroup != -1)
++					clearSatCR(frontend, true);
++			}
++			else if (oldSatcr == -1 || oldGroup != lnb_param.SatCR_dynGroup || oldSatcr != lnb_param.SatCR_idx)
++			{
++				if (simulate || !requestDynamicSatCR(frontend, lnb_idx, tunetimeout))
++				{
++					sec_sequence.push_back( eSecCommand(eSecCommand::START_TUNE_TIMEOUT, tunetimeout) );
++					frontend.setSecSequence(sec_sequence);
++					return EAGAIN;
++				}
++			}
+ 
+ 			if ( sat.frequency > lnb_param.m_lof_threshold )
+ 				band |= 1;
+@@ -742,8 +769,7 @@
+ 				eDVBDiseqcCommand diseqc;
+ 				memset(diseqc.data, 0, MAX_DISEQC_LENGTH);
+ 
+-				long oldSatcr, oldPin, oldDiction;
+-				frontend.getData(eDVBFrontend::SATCR, oldSatcr);
++				long oldPin, oldDiction;
+ 				frontend.getData(eDVBFrontend::PIN, oldPin);
+ 				frontend.getData(eDVBFrontend::DICTION, oldDiction);
+ 
+@@ -1074,71 +1100,246 @@
+ {
+ 	long satcr, diction, pin;
+ 	eSecCommandList sec_sequence;
+-
+-	// check if voltage is disabled
+-	eSecCommand::pair compare;
+-	compare.steps = +9;	//only close frontend
+-	compare.voltage = iDVBFrontend::voltageOff;
+-
+-	sec_sequence.push_back( eSecCommand(eSecCommand::IF_VOLTAGE_GOTO, compare) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SET_VOLTAGE, iDVBFrontend::voltage13) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SLEEP, m_params[DELAY_AFTER_ENABLE_VOLTAGE_BEFORE_SWITCH_CMDS]) );
+-
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SET_VOLTAGE, iDVBFrontend::voltage18_5) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SET_TONE, iDVBFrontend::toneOff) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SLEEP, m_params[DELAY_AFTER_VOLTAGE_CHANGE_BEFORE_SWITCH_CMDS]) );
+-
+-	eDVBDiseqcCommand diseqc;
+-	memset(diseqc.data, 0, MAX_DISEQC_LENGTH);
++	
+ 	frontend.getData(eDVBFrontend::SATCR, satcr);
+ 	frontend.getData(eDVBFrontend::DICTION, diction);
+ 	frontend.getData(eDVBFrontend::PIN, pin);
++	
++	if (satcr > -1)
++	{
++		// check if voltage is disabled
++		eSecCommand::pair compare;
++		compare.steps = +9;	//only close frontend
++		compare.voltage = iDVBFrontend::voltageOff;
++
++		sec_sequence.push_back( eSecCommand(eSecCommand::IF_VOLTAGE_GOTO, compare) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::SET_VOLTAGE, iDVBFrontend::voltage13) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::SLEEP, m_params[DELAY_AFTER_ENABLE_VOLTAGE_BEFORE_SWITCH_CMDS]) );
++
++		sec_sequence.push_back( eSecCommand(eSecCommand::SET_VOLTAGE, iDVBFrontend::voltage18_5) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::SET_TONE, iDVBFrontend::toneOff) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::SLEEP, m_params[DELAY_AFTER_VOLTAGE_CHANGE_BEFORE_SWITCH_CMDS]) );
++
++		eDVBDiseqcCommand diseqc;
++		memset(diseqc.data, 0, MAX_DISEQC_LENGTH);
++
++		switch (diction)
++		{
++			case 1:
++				if(pin < 1)
++				{
++					diseqc.len = 4;
++					diseqc.data[0] = 0x70;
++				}
++				else
++				{
++					diseqc.len = 5;
++					diseqc.data[0] = 0x71;
++					diseqc.data[4] = pin;
++				}
++				diseqc.data[1] = satcr << 3;
++				diseqc.data[2] = 0x00;
++				diseqc.data[3] = 0x00;
++				break;
++			case 0:
++			default:
++				if(pin < 1)
++				{
++					diseqc.len = 5;
++					diseqc.data[2] = 0x5A;
++				}
++				else
++				{
++					diseqc.len = 6;
++					diseqc.data[2] = 0x5C;
++					diseqc.data[5] = pin;
++				}
++				diseqc.data[0] = 0xE0;
++				diseqc.data[1] = 0x10;
++				diseqc.data[3] = satcr << 5;
++				diseqc.data[4] = 0x00;
++				break;
++		}
++
++		sec_sequence.push_back( eSecCommand(eSecCommand::SEND_DISEQC, diseqc) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::SLEEP, m_params[DELAY_AFTER_LAST_DISEQC_CMD]) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::SET_VOLTAGE, iDVBFrontend::voltage13) );
++		sec_sequence.push_back( eSecCommand(eSecCommand::DELAYED_CLOSE_FRONTEND) );
+ 
+-	switch (diction)
++		frontend.setSecSequence(sec_sequence);
++	}
++	clearSatCR(frontend, true);
++}
++
++void eDVBSatelliteEquipmentControl::clearSatCR(iDVBFrontend &frontend, bool close_socket)
++{
++	long sock;
++	std::map<int,ePtr<eUnicableTimer> >::iterator it, next;
++
++	for (it = m_unicableTimers.begin(); it != m_unicableTimers.end(); it = next)
+ 	{
+-		case 1:
+-			if(pin < 1)
+-			{
+-				diseqc.len = 4;
+-				diseqc.data[0] = 0x70;
+-			}
+-			else
+-			{
+-				diseqc.len = 5;
+-				diseqc.data[0] = 0x71;
+-				diseqc.data[4] = pin;
+-			}
+-			diseqc.data[1] = satcr << 3;
+-			diseqc.data[2] = 0x00;
+-			diseqc.data[3] = 0x00;
+-			break;
+-		case 0:
+-		default:
+-			if(pin < 1)
++		next = it;
++		next++;
++		if (it->second->removeFrontend(frontend) == 0)
++			m_unicableTimers.erase (it);
++	}
++	
++	frontend.getData(eDVBFrontend::SATCR_DYNSOCK, sock);
++	
++	if (sock >= 0 && close_socket)
++	{
++		::close (sock);
++		frontend.setData(eDVBFrontend::SATCR_DYNSOCK, -1);
++	}
++	
++	frontend.setData(eDVBFrontend::SATCR, -1);
++	frontend.setData(eDVBFrontend::SATCR_DYNGROUP, -1);
++	frontend.setData(eDVBFrontend::SATCR_RETRIES, -1);
++}
++
++bool eDVBSatelliteEquipmentControl::requestDynamicSatCR(iDVBFrontend &frontend, int lnb_idx, unsigned int &tunetimeout)
++{
++	static std::map<int,long> ipCache;
++	
++	eDVBSatelliteLNBParameters &lnb = m_lnbs[lnb_idx];
++	const bool haveHost = !lnb.SatCR_dynHost.empty();
++	
++	int group = lnb.SatCR_dynGroup;
++	int slot = frontend.readFrontendData(iDVBFrontend::frontendNumber);
++	long sock, retryCnt;
++	
++	frontend.getData(eDVBFrontend::SATCR_DYNSOCK, sock);
++	frontend.getData(eDVBFrontend::SATCR_RETRIES, retryCnt);
++	retryCnt++;
++	
++	if (group < 0)
++		return false;
++	
++	if (sock == -1)
++	{
++		if ( (sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1 )
++			return false;
++		const int one = 1;
++		int flags = -1;
++		if (::setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one)) == 0)
++			flags = ::fcntl(sock, F_GETFL, 0);
++		if (flags == -1 || ::fcntl(sock, F_SETFL, flags | O_NONBLOCK) != 0)
++		{
++			::close (sock);
++			return false;
++		}
++		frontend.setData(eDVBFrontend::SATCR_DYNSOCK, sock);
++		retryCnt = 0;
++	}
++	else
++	{
++		for (;;)
++		{
++			unsigned char pkt[20];
++			struct sockaddr addr;
++			socklen_t addr_len = sizeof(struct sockaddr_in); 
++			int len = ::recvfrom(sock, pkt, sizeof(pkt), 0, &addr, &addr_len);
++			if (len < 0)
+ 			{
+-				diseqc.len = 5;
+-				diseqc.data[2] = 0x5A;
++				if (errno != EAGAIN && errno != EWOULDBLOCK)
++				{
++					::close(sock);
++					frontend.setData(eDVBFrontend::SATCR_DYNSOCK, -1);
++					return false;
++				}
++				break;
+ 			}
+-			else
++			unsigned char expected[] = {0xa7, 0xd3, 2, group, slot, lnb.LNBNum};
++			if (len >= 19 && memcmp(pkt, expected, sizeof(expected)) == 0)
+ 			{
+-				diseqc.len = 6;
+-				diseqc.data[2] = 0x5C;
+-				diseqc.data[5] = pin;
++				clearSatCR(frontend, false);
++				lnb.SatCR_idx = pkt[6];
++				lnb.SatCR_format = pkt[7];
++				lnb.SatCRvco = (((int)pkt[8] << 8) + pkt[9]) * 1000;
++				lnb.m_lof_lo = (((int)pkt[10] << 8) + pkt[11]) * 1000;
++				lnb.m_lof_hi = (((int)pkt[12] << 8) + pkt[13]) * 1000;
++				lnb.m_lof_threshold = (((int)pkt[14] << 8) + pkt[15]) * 1000;
++				if (pkt[16] > 0)
++					lnb.SatCR_positions = pkt[16];
++				int keepalive = ((int)pkt[17] << 8) + pkt[18];
++				frontend.setData(eDVBFrontend::SATCR_DYNGROUP, group);
++				frontend.setData(eDVBFrontend::SATCR_RETRIES, -1);
++				eDebug("Received dynamic unicable response: channel %d, vco %d, lof %d/%d, threshold %d, %s, keepalive %ds",
++					lnb.SatCR_idx, lnb.SatCRvco, lnb.m_lof_lo, lnb.m_lof_hi, lnb.m_lof_threshold,
++					lnb.SatCR_format ? "JESS" : "EN50494", keepalive);
++				// dont connect() socket, as 'port unreachable'
++				// messages would stop it from working
++
++				if (m_unicableTimers.find(keepalive) == m_unicableTimers.end())
++				{
++					eUnicableTimer *t = new eUnicableTimer (keepalive);
++					m_unicableTimers.insert ( std::pair<int,ePtr<eUnicableTimer> >(keepalive, t));
++				}
++
++				m_unicableTimers[keepalive]->addFrontend(frontend, &addr, addr_len);
++
++				if (!haveHost && addr.sa_family == AF_INET)
++				{
++					struct sockaddr_in *addr_in = (struct sockaddr_in *) &addr;
++					ipCache[group] = addr_in->sin_addr.s_addr;
++				}
++				
++				return true;
+ 			}
+-			diseqc.data[0] = 0xE0;
+-			diseqc.data[1] = 0x10;
+-			diseqc.data[3] = satcr << 5;
+-			diseqc.data[4] = 0x00;
+-			break;
++		}
+ 	}
+-	frontend.setData(eDVBFrontend::SATCR, -1);
+-
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SEND_DISEQC, diseqc) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SLEEP, m_params[DELAY_AFTER_LAST_DISEQC_CMD]) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::SET_VOLTAGE, iDVBFrontend::voltage13) );
+-	sec_sequence.push_back( eSecCommand(eSecCommand::DELAYED_CLOSE_FRONTEND) );
+ 
+-	frontend.setSecSequence(sec_sequence);
++	struct sockaddr_in dst;	
++	memset (&dst, 0, sizeof (struct sockaddr_in));
++	dst.sin_addr.s_addr = INADDR_BROADCAST;
++	
++	if (haveHost)
++	{
++		struct addrinfo hints, *res = 0;
++		memset (&hints, 0, sizeof(struct addrinfo));
++		hints.ai_family = AF_INET;
++		hints.ai_socktype = SOCK_DGRAM;
++		if (!getaddrinfo (lnb.SatCR_dynHost.c_str(), NULL, &hints, &res) && res)
++		{
++			if (res->ai_addr->sa_family == AF_INET)
++				dst = *((struct sockaddr_in *)res->ai_addr);
++			freeaddrinfo(res);
++		}
++	}
++	else if (ipCache.find(group) != ipCache.end())
++	{
++		dst.sin_addr.s_addr = ipCache[group];
++	}
++	
++	char ipstr[INET_ADDRSTRLEN] = { 0 };
++	inet_ntop(AF_INET, &(dst.sin_addr), ipstr, sizeof(ipstr));
++	eDebug("Sending dynamic unicable request for group %d, slot %d to %s", group, slot, ipstr);
++		
++	dst.sin_family = AF_INET;
++	dst.sin_port = htons(5494);
++	
++	unsigned char pkt[] = {
++		0xa7, 0xd3, // magic
++		1,          // this is a request
++		(unsigned char) group,
++		(unsigned char) slot,
++		lnb.LNBNum,
++		0
++	};
++	
++	if (::sendto(sock, pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(struct sockaddr_in)) < 0)
++	{
++		::close(sock);
++		frontend.setData(eDVBFrontend::SATCR_DYNSOCK, -1);
++		return false;
++	}
++	
++	if (!haveHost && retryCnt > 6)
++		ipCache.erase(group);
++	
++	frontend.setData(eDVBFrontend::SATCR_RETRIES, retryCnt);
++	tunetimeout = (retryCnt > 8) ? 5000 : (10 * (1<<retryCnt));
++	return false;
+ }
+ 
+ RESULT eDVBSatelliteEquipmentControl::clear()
+@@ -1162,7 +1363,7 @@
+ 		it->m_frontend->setData(eDVBFrontend::LINKED_NEXT_PTR, -1);
+ 		it->m_frontend->setData(eDVBFrontend::ROTOR_POS, -1);
+ 		it->m_frontend->setData(eDVBFrontend::ROTOR_CMD, -1);
+-		it->m_frontend->setData(eDVBFrontend::SATCR, -1);
++		clearSatCR(*(it->m_frontend), true);
+ 
+ 		if (it->m_frontend->is_FBCTuner())
+ 		{
+@@ -1179,7 +1380,7 @@
+ 		it->m_frontend->setData(eDVBFrontend::LINKED_NEXT_PTR, -1);
+ 		it->m_frontend->setData(eDVBFrontend::ROTOR_POS, -1);
+ 		it->m_frontend->setData(eDVBFrontend::ROTOR_CMD, -1);
+-		it->m_frontend->setData(eDVBFrontend::SATCR, -1);
++		clearSatCR(*(it->m_frontend), true);
+ 	}
+ 
+ 	return 0;
+@@ -1438,6 +1639,28 @@
+ 	return 0;
+ }
+ 
++RESULT eDVBSatelliteEquipmentControl::setLNBSatCRDynGroup(int SatCR_dynGroup)
++{
++	eSecDebug("eDVBSatelliteEquipmentControl::setLNBSatCRDynGroup(%d)", SatCR_dynGroup)
++	if(SatCR_dynGroup < -1 || SatCR_dynGroup > 255)
++		return -EPERM;
++	if ( currentLNBValid() )
++		m_lnbs[m_lnbidx].SatCR_dynGroup = SatCR_dynGroup;
++	else
++		return -ENOENT;
++	return 0;
++}
++
++RESULT eDVBSatelliteEquipmentControl::setLNBSatCRDynHost(const std::string &host)
++{
++	eSecDebug("eDVBSatelliteEquipmentControl::setLNBSatCRDynHost(%s)", host.c_str())
++	if ( currentLNBValid() )
++		m_lnbs[m_lnbidx].SatCR_dynHost = host;
++	else
++		return -ENOENT;
++	return 0;
++}
++
+ RESULT eDVBSatelliteEquipmentControl::setLNBSatCRvco(int SatCRvco)
+ {
+ 	eSecDebug("eDVBSatelliteEquipmentControl::setLNBSatCRvco(%d)", SatCRvco);
+@@ -1485,6 +1708,20 @@
+ 	return -ENOENT;
+ }
+ 
++RESULT eDVBSatelliteEquipmentControl::getLNBSatCRDynGroup()
++{
++	if ( currentLNBValid() )
++		return m_lnbs[m_lnbidx].SatCR_dynGroup;
++	return -ENOENT;
++}
++
++std::string eDVBSatelliteEquipmentControl::getLNBSatCRDynHost()
++{
++	if ( currentLNBValid() )
++		return m_lnbs[m_lnbidx].SatCR_dynHost;
++	return "";
++}
++
+ RESULT eDVBSatelliteEquipmentControl::getLNBSatCRvco()
+ {
+ 	if ( currentLNBValid() )
+@@ -1698,3 +1935,75 @@
+ 	else
+ 		m_rotorMoving &= ~(1 << slot_no);
+ }
++
++DEFINE_REF(eUnicableTimer);
++
++eUnicableTimer::eUnicableTimer(int interval)
++	:m_interval(interval), m_timeout(0)
++{
++	m_timeout = eTimer::create();
++	CONNECT(m_timeout->timeout, eUnicableTimer::timeout);
++	m_timeout->start(m_interval*1000,false);
++}
++
++int eUnicableTimer::addFrontend(iDVBFrontend &frontend, struct sockaddr *addr, int addrlen)
++{
++	std::vector<char> v ((char*)addr, ((char*)addr) + addrlen);
++	m_frontends.insert (std::pair<iDVBFrontend*,std::vector<char> >(&frontend,v));
++	return m_frontends.size();
++}
++
++int eUnicableTimer::removeFrontend(iDVBFrontend &frontend)
++{
++	std::map<iDVBFrontend*,std::vector<char> >::iterator it = m_frontends.find (&frontend);
++	if (it != m_frontends.end())
++	{
++		sendpkt(it, true);
++		m_frontends.erase (it);
++	}
++
++	return m_frontends.size();
++}
++
++void eUnicableTimer::sendpkt(std::map<iDVBFrontend*,std::vector<char> >::iterator it, bool release)
++{
++	long group, sock, satcr;
++	iDVBFrontend *frontend = it->first;
++	struct sockaddr *addr = (struct sockaddr *) &it->second[0];
++	int addr_len = it->second.size();
++	
++	int slot = frontend->readFrontendData(iDVBFrontend::frontendNumber);
++	frontend->getData(eDVBFrontend::SATCR_DYNGROUP, group);
++	frontend->getData(eDVBFrontend::SATCR_DYNSOCK, sock);
++	frontend->getData(eDVBFrontend::SATCR, satcr);
++	
++	if (sock > 0 && satcr >= 0 && group >= 0)
++	{
++		unsigned char pkt[] = {
++			0xa7, 0xd3,
++			release ? 4 : 3,
++			(unsigned char) group,
++			(unsigned char) slot,
++			0,
++			(unsigned char) satcr
++		};
++		
++		eDebug("Sending dynamic unicable %s for group %d, slot %d, channel %d",
++			release ? "release" : "keepalive", group, slot, satcr);
++			
++		if (sendto (sock, pkt, sizeof(pkt), 0, addr, addr_len) < 0)
++		{
++			::close (sock);
++			frontend->setData(eDVBFrontend::SATCR_DYNSOCK, -1);
++		}
++	}
++}
++
++void eUnicableTimer::timeout()
++{
++	std::map<iDVBFrontend*,std::vector<char> >::iterator it;
++	for (it = m_frontends.begin(); it != m_frontends.end(); ++it) 
++	{
++		sendpkt (it, false);
++	}
++}
+diff -ur a/lib/dvb/sec.h b/lib/dvb/sec.h
+--- a/lib/dvb/sec.h	2018-04-09 12:11:52.000000000 +0200
++++ b/lib/dvb/sec.h	2018-06-24 11:33:01.000000000 +0200
+@@ -142,6 +142,23 @@
+ 		return *this;
+ 	}
+ };
++
++class eUnicableTimer : public Object
++{
++private:
++	DECLARE_REF(eUnicableTimer);
++	const int m_interval;
++	std::map<iDVBFrontend*,std::vector<char> > m_frontends;
++	ePtr<eTimer> m_timeout;
++	
++	void timeout();
++	void sendpkt(std::map<iDVBFrontend*,std::vector<char> >::iterator it, bool release);
++
++public:
++	eUnicableTimer(int interval);
++	int addFrontend(iDVBFrontend &frontend, struct sockaddr *addr, int addrlen);
++	int removeFrontend(iDVBFrontend &frontend);
++};
+ #endif
+ 
+ class eDVBSatelliteDiseqcParameters
+@@ -268,6 +285,8 @@
+ 	int SatCR_positions;
+ 	int SatCR_idx;
+ 	int SatCR_format;
++	int SatCR_dynGroup;
++	std::string SatCR_dynHost;
+ 	unsigned int SatCRvco;
+ 	unsigned int UnicableTuningWord;
+ 	unsigned int UnicableConfigWord;
+@@ -316,6 +335,7 @@
+ 	int m_rotorMoving;
+ 	int m_not_linked_slot_mask;
+ 	bool m_canMeasureInputPower;
++	std::map<int,ePtr<eUnicableTimer> > m_unicableTimers;
+ #endif
+ #ifdef SWIG
+ 	eDVBSatelliteEquipmentControl();
+@@ -327,6 +347,8 @@
+ 	eDVBSatelliteEquipmentControl(eSmartPtrList<eDVBRegisteredFrontend> &avail_frontends, eSmartPtrList<eDVBRegisteredFrontend> &avail_simulate_frontends);
+ 	RESULT prepare(iDVBFrontend &frontend, FRONTENDPARAMETERS &parm, const eDVBFrontendParametersSatellite &sat, int frontend_id, unsigned int tunetimeout);
+ 	void prepareTurnOffSatCR(iDVBFrontend &frontend); // used for unicable
++	void clearSatCR(iDVBFrontend &frontend, bool close_socket);
++	bool requestDynamicSatCR(iDVBFrontend &frontend, int lnb_idx, unsigned int &tunetimeout);
+ 	int canTune(const eDVBFrontendParametersSatellite &feparm, iDVBFrontend *, int frontend_id, int *highest_score_lnb=0);
+ 	bool currentLNBValid() { return m_lnbidx > -1 && m_lnbidx < (int)(sizeof(m_lnbs) / sizeof(eDVBSatelliteLNBParameters)); }
+ #endif
+@@ -362,10 +384,14 @@
+ /* Unicable Specific Parameters */
+ 	RESULT setLNBSatCRformat(int SatCR_format);	//DiSEqc or JESS (or ...)
+ 	RESULT setLNBSatCR(int SatCR_idx);
++	RESULT setLNBSatCRDynGroup(int SATCR_dynGroup);
++	RESULT setLNBSatCRDynHost(const std::string &host);
+ 	RESULT setLNBSatCRvco(int SatCRvco);
+ 	RESULT setLNBSatCRpositions(int SatCR_positions);
+ 	RESULT getLNBSatCRformat();	//DiSEqc or JESS (or ...)
+ 	RESULT getLNBSatCR();
++	RESULT getLNBSatCRDynGroup();
++	std::string getLNBSatCRDynHost();
+ 	RESULT getLNBSatCRvco();
+ 	RESULT getLNBSatCRpositions();
+ /* Satellite Specific Parameters */
+diff -ur a/lib/python/Components/NimManager.py b/lib/python/Components/NimManager.py
+--- a/lib/python/Components/NimManager.py	2018-04-09 12:11:52.000000000 +0200
++++ b/lib/python/Components/NimManager.py	2018-07-03 09:21:40.000000000 +0200
+@@ -55,6 +55,7 @@
+ 			for slot in self.linked[slotid]:
+ 				tunermask |= (1 << slot)
+ 		sec.setLNBSatCR(-1)
++		sec.setLNBSatCRDynGroup(-1)
+ 		sec.setLNBNum(1)
+ 		sec.setLNBLOFL(9750000)
+ 		sec.setLNBLOFH(10600000)
+@@ -179,6 +180,12 @@
+ 					if not self.satposdepends.has_key(connto):
+ 						self.satposdepends[connto] = []
+ 					self.satposdepends[connto].append(x)
++					
++		if self.NimManager.unicable_server is not None:
++			try:
++				self.NimManager.unicable_server.stdin.write ('c\n')
++			except (OSError, IOError):
++				self.NimManager.unicable_server = None
+ 
+ 		for slot in nim_slots:
+ 			x = slot.slot
+@@ -300,12 +307,21 @@
+ 
+ 				if currLnb.lof.value != "unicable":
+ 					sec.setLNBSatCR(-1)
++					sec.setLNBSatCRDynGroup(-1)
+ 
+ 				if currLnb.lof.value == "universal_lnb":
+ 					sec.setLNBLOFL(9750000)
+ 					sec.setLNBLOFH(10600000)
+ 					sec.setLNBThreshold(11700000)
+ 				elif currLnb.lof.value == "unicable":
++					def addUnicableServer(line):
++						import subprocess
++						try:
++							if self.NimManager.unicable_server is None:
++								self.NimManager.unicable_server = subprocess.Popen(["unicablesrv"],stdin=subprocess.PIPE)
++							self.NimManager.unicable_server.stdin.write(line + '\n')
++						except (OSError, IOError):
++							self.NimManager.unicable_server = None
+ 					def setupUnicable(configManufacturer, ProductDict):
+ 						manufacturer_name = configManufacturer.value
+ 						manufacturer = ProductDict[manufacturer_name]
+@@ -316,17 +332,34 @@
+ 						if product_name in manufacturer_scr:
+ 							diction = manufacturer.diction[product_name].value
+ 							if x <= manufacturer_positions_value or diction !="EN50607": #for every allowed position
+-								sec.setLNBSatCR(manufacturer_scr[product_name].index)
+-
++								satcr = manufacturer_scr[product_name].index
++								vco = manufacturer.vco[product_name][satcr].value*1000
+ 								if diction =="EN50607":
+-									sec.setLNBSatCRformat(1)	#JESS
++									format = 1	#JESS
+ 								else:
+-									sec.setLNBSatCRformat(0)	#DiSEqC
+-								sec.setLNBSatCRvco(manufacturer.vco[product_name][manufacturer_scr[product_name].index].value*1000)
++									format = 0	#DiSEqC
++								lofl = manufacturer.lofl[product_name][position_idx].value * 1000
++								lofh = manufacturer.lofh[product_name][position_idx].value * 1000
++								threshold = manufacturer.loft[product_name][position_idx].value * 1000
++								
++								sec.setLNBSatCRformat(format)
++								sec.setLNBSatCRvco(vco)
+ 								sec.setLNBSatCRpositions(manufacturer_positions_value)
+-								sec.setLNBLOFL(manufacturer.lofl[product_name][position_idx].value * 1000)
+-								sec.setLNBLOFH(manufacturer.lofh[product_name][position_idx].value * 1000)
+-								sec.setLNBThreshold(manufacturer.loft[product_name][position_idx].value * 1000)
++								sec.setLNBLOFL(lofl)
++								sec.setLNBLOFH(lofh)
++								sec.setLNBThreshold(threshold)
++								serveGroup = int(currLnb.serveSCRGroup.value)
++								if serveGroup == -1:
++									sec.setLNBSatCR(satcr)
++									sec.setLNBSatCRDynGroup(-1)
++								else:
++									channels = len(manufacturer.vco[product_name])
++									lineData = [serveGroup, format, lofl/1000, lofh/1000, threshold/1000, manufacturer_positions_value, satcr, channels-satcr] + \
++										[manufacturer.vco[product_name][y].value for y in range(satcr, channels)]
++									addUnicableServer("a " + " ".join(str(x) for x in lineData))
++									sec.setLNBSatCR(-1)
++									sec.setLNBSatCRDynGroup(serveGroup)
++									sec.setLNBSatCRDynHost("127.0.0.1")
+ 								configManufacturer.save_forced = True
+ 								manufacturer.product.save_forced = True
+ 								manufacturer.vco[product_name][manufacturer_scr[product_name].index].save_forced = True
+@@ -350,10 +383,21 @@
+ 						sec.setLNBLOFH(currLnb.lofh.value * 1000)
+ 						sec.setLNBThreshold(currLnb.threshold.value * 1000)
+ 						sec.setLNBSatCRpositions(64)	#HACK
++						sec.setLNBSatCRDynGroup(-1)
+ 					elif currLnb.unicable.value == "unicable_matrix":
+ 						setupUnicable(currLnb.unicableMatrixManufacturer, currLnb.unicableMatrix)
+ 					elif currLnb.unicable.value == "unicable_lnb":
+ 						setupUnicable(currLnb.unicableLnbManufacturer, currLnb.unicableLnb)
++					elif currLnb.unicable.value == "unicable_dynamic":
++						sec.setLNBSatCRformat(0)
++						sec.setLNBSatCRvco(0)
++						sec.setLNBSatCRpositions(64)
++						sec.setLNBLOFL(0)
++						sec.setLNBLOFH(0)
++						sec.setLNBThreshold(0)
++						sec.setLNBSatCR(-1)
++						sec.setLNBSatCRDynGroup(int(currLnb.dynamicSCR.value))
++						sec.setLNBSatCRDynHost("")
+ 				elif currLnb.lof.value == "c_band":
+ 					sec.setLNBLOFL(5150000)
+ 					sec.setLNBLOFH(5150000)
+@@ -867,6 +911,7 @@
+ 		self.satList = [ ]
+ 		self.cablesList = []
+ 		self.terrestrialsList = []
++		self.unicable_server = None
+ 		self.enumerateNIMs()
+ 		self.readTransponders()
+ 		InitNimManager(self)	#init config stuff
+@@ -1270,6 +1315,7 @@
+ 	unicable_choices = {
+ 		"unicable_lnb": _("Unicable LNB"),
+ 		"unicable_matrix": _("Unicable Martix"),
++		"unicable_dynamic": _("Dynamic Unicable"),
+ 		"unicable_user": "Unicable "+_("User defined")}
+ 	unicable_choices_default = "unicable_lnb"
+ 
+@@ -1280,6 +1326,9 @@
+ 								   ("17", "SatCR 17"), ("18", "SatCR 18"), ("19", "SatCR 19"), ("20", "SatCR 20"), ("21", "SatCR 21"), ("22", "SatCR 22"), ("23", "SatCR 23"), ("24", "SatCR 24"),
+ 								   ("25", "SatCR 25"), ("26", "SatCR 26"), ("27", "SatCR 27"), ("28", "SatCR 28"), ("29", "SatCR 29"), ("30", "SatCR 30"), ("31", "SatCR 31"), ("32", "SatCR 32")]
+ 
++	unicable_dynamic_choices = [(str(y), _("Group") + " " + str(y)) for y in range(1, 10)]
++	unicable_serve_choices = [("-1", _("Off"))] + unicable_dynamic_choices
++
+ 	advanced_lnb_diction_user_choices = [("EN50494", "Unicable(EN50494)"), ("EN50607", "JESS(EN50607)")]
+ 
+ 	prio_list = [ ("-1", _("Auto")) ]
+@@ -1448,6 +1497,9 @@
+ 			tmp.append(ConfigInteger(default=1980, limits = (950, 2150)))
+ 			tmp.append(ConfigInteger(default=2096, limits = (950, 2150)))
+ 			section.satcrvcouserEN50607 = tmp 
++			
++			section.dynamicSCR = ConfigSelection(unicable_dynamic_choices, default="1")
++			section.serveSCRGroup = ConfigSelection(unicable_serve_choices, default="-1")
+ 
+ 			nim.advanced.unicableconnected = ConfigYesNo(default=False)
+ 			nim.advanced.unicableconnectedTo = ConfigSelection([(str(id), nimmgr.getNimDescription(id)) for id in nimmgr.getNimListOfType("DVB-S") if id != x])
+diff -ur a/lib/python/Screens/Satconfig.py b/lib/python/Screens/Satconfig.py
+--- a/lib/python/Screens/Satconfig.py	2018-04-09 12:11:52.000000000 +0200
++++ b/lib/python/Screens/Satconfig.py	2018-07-03 09:18:18.000000000 +0200
+@@ -102,6 +102,7 @@
+ 		self.advancedManufacturer = None
+ 		self.advancedSCR = None
+ 		self.advancedDiction = None
++		self.advancedServeGroup = None
+ 		self.advancedConnected = None
+ 		
+ 		if self.nim.isMultiType():
+@@ -213,7 +214,7 @@
+ 		checkList = (self.configMode, self.diseqcModeEntry, self.advancedSatsEntry, \
+ 			self.advancedLnbsEntry, self.advancedDiseqcMode, self.advancedUsalsEntry, \
+ 			self.advancedLof, self.advancedPowerMeasurement, self.turningSpeed, \
+-			self.advancedType, self.advancedSCR, self.advancedDiction, self.advancedManufacturer, self.advancedUnicable, self.advancedConnected, \
++			self.advancedType, self.advancedSCR, self.advancedDiction, self.advancedServeGroup, self.advancedManufacturer, self.advancedUnicable, self.advancedConnected, \
+ 			self.uncommittedDiseqcCommand, self.cableScanType, self.multiType)
+ 		if self["config"].getCurrent() == self.multiType:
+ 			update_slots = [self.slotid]
+@@ -296,8 +297,11 @@
+ 					self.list.append(self.advancedManufacturer)
+ 					if product_name in manufacturer.scr:
+ 						diction = manufacturer.diction[product_name].value
++						self.advancedServeGroup = getConfigListEntry(_("Serve Group"), currLnb.serveSCRGroup)
++						self.list.append(self.advancedServeGroup)
+ 						self.advancedType = getConfigListEntry(_("Type"), manufacturer.product)
+-						self.advancedSCR = getConfigListEntry(_("Channel"), manufacturer.scr[product_name])
++						channel_caption = _("Channel") if currLnb.serveSCRGroup.value == "-1" else _("First Channel")
++						self.advancedSCR = getConfigListEntry(channel_caption, manufacturer.scr[product_name])
+ 						self.list.append(self.advancedType)
+ 						self.list.append(self.advancedSCR)
+ 						self.list.append(getConfigListEntry(_("Frequency"), manufacturer.vco[product_name][manufacturer.scr[product_name].index])) 
+@@ -310,12 +314,17 @@
+ 					self.list.append(self.advancedManufacturer)
+ 					if product_name in manufacturer.scr:
+ 						diction = manufacturer.diction[product_name].value
++						self.advancedServeGroup = getConfigListEntry(_("Serve Group"), currLnb.serveSCRGroup)
++						self.list.append(self.advancedServeGroup)
+ 						self.advancedType = getConfigListEntry(_("Type"), manufacturer.product)
+-						self.advancedSCR = getConfigListEntry(_("Channel"), manufacturer.scr[product_name])
++						channel_caption = _("Channel") if currLnb.serveSCRGroup.value == "-1" else _("First Channel")
++						self.advancedSCR = getConfigListEntry(channel_caption, manufacturer.scr[product_name])
+ 						self.list.append(self.advancedType)
+ 						self.list.append(self.advancedSCR)
+ 						self.list.append(getConfigListEntry(_("Frequency"), manufacturer.vco[product_name][manufacturer.scr[product_name].index])) 
+-
++				elif currLnb.unicable.value == "unicable_dynamic":
++					self.list.append(getConfigListEntry(_("Group"), currLnb.dynamicSCR))
++						
+ 				choices = []
+ 				connectable = nimmanager.canConnectTo(self.slotid)
+ 				for id in connectable:
