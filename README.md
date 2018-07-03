@@ -3,9 +3,9 @@
 
 This project aims to extend Vu+ set-top boxes by an Unicable mode that allows them to dynamically allocate user channels when and where they are needed. 
 
-Unicable allows multiple satellite receiver boxes to simultaneously operate on a single cable. The downside of classical Unicable is the need for every tuner to be statically assigned a fixed separate user channel. As usually not all tuners are operated at the same time, the Unicable matrix in this case is very poorly utilized and has to yield more user channels than actually are used simultaneously.
+Unicable allows multiple satellite receiver boxes to be simultaneously operated on a single cable. The downside of conventional Unicable is the need for every tuner to be statically assigned a fixed separate user channel. As usually not all tuners are operated at the same time, the Unicable matrix in this case is very poorly utilized and has to yield more user channels than will ever be used simultaneously.
 
-With this extension, Vu+ boxes dynamically allocate user channels on demand using the LAN. For this purpose, one always-on box is configured to manage user channels and all other boxes request and are assigned channels when they are needed.
+With this extension, Vu+ boxes dynamically allocate user channels on demand using the local network. For this purpose, one always-on box is configured to manage user channels and all other boxes request and are assigned channels when they are needed.
 
 ## Installation
 
@@ -39,7 +39,7 @@ The protocol is designed to be simple and robust. It uses UDP on port 5494 and k
 | Type       | 1 byte  | = 1                                   |
 | Group      | 1 byte  | identifies different ports of matrix  |
 | Slot       | 1 byte  | identifies tuner in one device        |
-| Lnb Number | 1 byte  |                                       |
+| LNB Number | 1 byte  |                                       |
 | Channel    | 1 byte  | = 0                                   |
 
 ### response Message
@@ -50,7 +50,7 @@ The protocol is designed to be simple and robust. It uses UDP on port 5494 and k
 | Type               | 1 byte  | = 2                                       |
 | Group              | 1 byte  | echoed from request                       |
 | Slot               | 1 byte  | echoed from request                       |
-| Lnb Number         | 1 byte  | echoed from request                       |
+| LNB Number         | 1 byte  | echoed from request                       |
 | Channel            | 1 byte  |                                           |
 | Format             | 1 byte  | = 0 for EN50494, = 1 for JESS             |
 | Frequency          | 2 bytes | in MHz, corresponding to assigned channel |
@@ -68,7 +68,7 @@ The protocol is designed to be simple and robust. It uses UDP on port 5494 and k
 | Type       | 1 byte  | = 3      |
 | Group      | 1 byte  |          |
 | Slot       | 1 byte  |          |
-| Lnb Number | 1 byte  |          |
+| LNB Number | 1 byte  |          |
 | Channel    | 1 byte  |          |
 
 ### release Message
@@ -79,6 +79,6 @@ The protocol is designed to be simple and robust. It uses UDP on port 5494 and k
 | Type       | 1 byte  | = 4      |
 | Group      | 1 byte  |          |
 | Slot       | 1 byte  |          |
-| Lnb Number | 1 byte  |          |
+| LNB Number | 1 byte  |          |
 | Channel    | 1 byte  |          |
 
