@@ -22,6 +22,7 @@ where `vusolo2` might also be `vusolo`, `bm750`, `vuuno` or `vuultimo`, dependin
 ## Configuration
 
 - Pick one always-on box and configure one tuner of this device as usual, but set "Serve Group" to "Group 1" and "First Channel" to 1. If any of your devices does not support this dynamic Unicable extension, set "First Channel" appropriately higher, so that you can use the lowest channels for static configuration.
+
   **Do not enable "Serve Group" on more than one device for the same group !**
 - On all remaining devices set "Unicable Configuration Mode" to "Dynamic Unicable" and "Group" to "Group 1".
 - done.
